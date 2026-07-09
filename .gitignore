@@ -1,0 +1,29 @@
+# --- build output ---
+/build/
+*.o
+*.a
+
+# --- dev scratch: screenshots, GIMP files ---
+*.png
+*.jpg
+*.xcf
+# ...except the README gallery
+!screenshot_samples/duel.png
+!screenshot_samples/duel_result.png
+!screenshot_samples/first_encounter.png
+!screenshot_samples/blowup_particles.png
+!screenshot_samples/ufo_fight.png
+
+# --- editor / OS junk ---
+*.sw?
+.*.sw?
+*~
+.DS_Store
+
+# --- local agent/editor config ---
+.claude/settings.local.json
+
+# --- original game data: bring-your-own, NEVER redistribute ---
+/game_root/
+/SkippyAdventure/
+/wine/
