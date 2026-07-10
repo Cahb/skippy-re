@@ -3,7 +3,7 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Wshadow -O2 -Isrc
 BIN     := build
 
-.PHONY: all clean test test_jjm test_mdl test_thm game run
+.PHONY: all clean test test_jjm test_mdl test_thm game run win
 
 all: $(BIN)/test_jjm $(BIN)/test_mdl $(BIN)/test_thm $(BIN)/test_tga $(BIN)/test_gam $(BIN)/test_level
 
@@ -68,3 +68,14 @@ game: $(BIN)/game
 BASE ?= ../game_root/EN
 LEVEL ?=
 run: $(BIN)/game ; ./$(BIN)/game "$(BASE)" $(LEVEL)
+
+# ---- windows cross build (self-contained static .exe) ----
+# Needs: gcc-mingw-w64-x86-64 + a MinGW-built libraylib.a, e.g.:
+#   make -C ../raylib-6.0-src/src PLATFORM=PLATFORM_DESKTOP OS=Windows_NT \
+#        CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar
+MINGW      ?= x86_64-w64-mingw32
+RAYLIB_WIN ?= ../raylib-6.0-src/src
+WIN_LIBS   := -lraylib -lopengl32 -lgdi32 -lwinmm
+$(BIN)/game.exe: $(GAME_SRC) | $(BIN)
+	$(MINGW)-gcc $(CFLAGS) -I$(RAYLIB_WIN) -o $@ $^ -L$(RAYLIB_WIN) $(WIN_LIBS) -static -static-libgcc -lm
+win: $(BIN)/game.exe
