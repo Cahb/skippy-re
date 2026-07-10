@@ -105,6 +105,11 @@ typedef struct {
 	bool    is_thrower;    /* enemy variant: chases like a catcher but slower, lobs bombs,
 	                        * and is HARMLESS on contact (dangerous only via its bombs) */
 	float   throw_cd;      /* thrower bomb cooldown (seconds) */
+	unsigned char  ai_type; /* enemy behaviour, authored in the spawn tile's clip_rule
+	                         * (re_g6_enemy_ai.md §3): 0 chase player, 1 walk to exit,
+	                         * 2 seek crystals, 3 seek type-5 cells, 5 follow a catcher */
+	unsigned short ai_cap;  /* pathfinder pop budget = the de-facto aggro range
+	                         * (50 default; 400/100/150 for types 1/2/3) */
 
 	/* interpolated render pose (world Z-up; x/y are cell-centered) */
 	float   rx, ry, rz;

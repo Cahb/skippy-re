@@ -77,6 +77,96 @@ return 1;
 - `ai_pathfind_step_toward` reads `pathobj[0xe] -> +0x10/+0x14`, converts the delta to a
   cardinal command: `dy=-1→1(up)`, `dx=+1→2(right)`, `dy=+1→3(down)`, `dx=-1→4(left)`.
 
+## 2b. A* internals — complete spec (dig 2026-07-10, closes the §2 gaps)
+
+Decompiled `astar_expand_neighbors` 0x401ef0, `astar_pop_best_node` 0x401ec0, and the
+node-insert/relax chain `FUN_00402000` / `FUN_00402170` (sorted insert) /
+`FUN_00402130`+`FUN_00402150` (open/closed lookup by cell_id) / `FUN_004021b0` (relax
+propagation). This makes the search byte-explainable:
+
+- **f = g + h**, where **g = hop count** (`parent.g + 1`, uniform cost 1/step) and
+  **h = (dx² + dy²) to the goal (enemy)**. Node ints: `[0]=f [1]=h [2]=g [4]=x [5]=y
+  [6]=cell_id [7]=parent +0x20..+0x3c children[8] +0x40 link`.
+- **Open list is a singly-linked list kept sorted ascending by f at INSERT time**
+  (`FUN_00402170`); `astar_pop_best_node` does NOT scan — it just unlinks the head and
+  pushes it onto the closed list (+6 = open sentinel, +10 = closed sentinel). §2's
+  "lowest f" is realized by the sorted insert, not the pop.
+- **Tie-break: a new node is inserted BEFORE existing equal-f nodes** (insert walks
+  while `list.f < new.f`), i.e. LIFO on f-plateaus → depth-first-ish sweep. Observable
+  in path shapes; must be replicated for exact wake boundaries.
+- **Expansion order is fixed**: (x, y-1), (x+1, y), (x, y+1), (x-1, y) — up, right,
+  down, left.
+- **Neighbor filter = `is_cell_walkable(nb)` && `tile_passable(to=cur, from=nb)`** —
+  note the argument order: expand validates the move **nb → cur**, i.e. every edge is
+  checked in **the enemy's own travel direction** (the tree path goal→root is exactly
+  the enemy's walk toward the target). Drops go downhill toward the player; there is
+  no orientation reversal. (Corrects the earlier draft of this section.)
+- **Duplicates/relax**: neighbor already in OPEN with better g → fields updated in
+  place (parent/g/f), **no re-sort** (stale position tolerated). Already in CLOSED
+  with better g → update + `FUN_004021b0`: propagate the improved g through the
+  recorded `children[8]` arrays with a work-queue (classic Nilsson A* child
+  propagation, no reopening).
+- Every expanded node records the neighbor in its `children[8]` array regardless of
+  which case hit (used only by the propagation above).
+- The **cap counts pops** (loop `iters < pathobj[0x2f]`), default 50 (§3 overrides).
+
+Rewrite deltas this exposes (beyond §7's cap fix, which is already in `sim.c`):
+`ai_next_dir` is enemy-rooted (orig: player-rooted, reversed edge orientation),
+pure-greedy on h (orig: f=g+h, ties LIFO, fixed NESW order), and uses the simplified
+`ai_passable` instead of `is_cell_walkable`+`tile_passable` — plus the §4 step gates
+are not applied per hop. On sparse maps (Space) these change which enemies a 50-pop
+budget reaches, i.e. the observed aggro mismatches.
+
+## 2c. tile_passable (0x41f500) — full clause transcription (dig 2026-07-10, part 2)
+
+Decompiled in full; it is a **write-then-override chain** (later clauses overwrite the
+verdict), with `from` = the cell the mover leaves, `to` = the cell being entered:
+
+1. from is a stair + move along its axis → pass.
+2. `to.z == from.z` and to is not a rutsche(0x10) → pass. Heights differ (or to is a
+   rutsche) → pass only via **elevator endpoints**: from-or-to of type 9 whose
+   `z0/z1 (+0x1d3/+0x1d4)` equals the other cell's z (plannable while the car is away;
+   boarding TIMING is step-validation's job, §4).
+3. from not a stair: `0 < from.z - to.z < 3` onto a non-rutsche → verdict =
+   `to.walkable_override == 0` (a 1–2 **hop-down**, not onto a bridge plank; this
+   OVERWRITES an earlier pass). from is a stair: descend rule (to.z == from.z − 1
+   along the axis).
+4. to is a rutsche at equal z → verdict = move dir equals its forced dir (+0x1f2);
+   from is a rutsche → pass (always exitable).
+5. to is a jump-pad(0x0e) → verdict = the cell one-further along the move dir sits at
+   the pad's launch height (+0x1f1); from is a jump-pad → pass (portal exit, height
+   ignored).
+6. **Glue gate (the tail RETURN)**: to is glue(0x02) with `entity_reservation == 0` →
+   RETURN `(cell two steps from `from` along the move dir).entity_reservation == 4`.
+
+`+0x1a5` is **entity_reservation** (found_structs tile `pad1[5]`): stamped on cells an
+entity occupies/is entering, **4 = the player**. So clause 6 means: *a fresh glue cell
+can only be ENTERED while the player is standing right beyond it*. Glue pens stay
+sealed until the player crosses the escape lane — verified vs Space\Bonus footage:
+all four robots dormant with the player at spawn (7,9), the (5,8) robot wakes exactly
+when the player is on the (7,8) ice, the (10,5) robot at (10,7). `is_cell_walkable`'s
+mode-2 switch clause uses the same field (switch passable for catchers only when
+occupied or reservation == 4). **Ice (0x15) has NO special clause** — plain floor in
+the graph; ice behaviour is execution physics, not planning.
+
+**Axis note:** the original's (x,y) are TRANSPOSED vs the rewrite's `tiles[x][y]`
+(its dir codes map 1 → the rewrite's −X, cf. SPAWN_FACE). The expansion order in
+rewrite coords is therefore `(x-1,y) (x,y+1) (x+1,y) (x,y-1)` — verified by the
+Forest\EnemyStart frog opening −Y along column 13 (LIFO ties pop +X before +Y).
+
+**Mover tracks are plannable floor:** `register_platform_cell` (0x417e20) walks the
+platform's WHOLE track run through the empty cells and stamps a per-cell flag (=1),
+the platform id, and the track z into a parallel per-cell grid (manager+0x2ab729
+area). So the void cells a platform crosses are graph NODES at the track height;
+only the step EXECUTION is gated on the car actually being there (§4). That's how an
+enemy paths up to a mover gap, waits at the lip, boards, and rides across
+(verified: Candy\Candy01 (1,8) type-0x0a mover).
+
+**Rewrite port:** `src/sim/sim.c` `mover_track_z/ai_z/ai_walkable/ai_edge/
+ai_next_dir/ai_target/ai_step` implement all of §2b/§2c plus the §3 target/cap table
+(types 5/7 approximated) and §4 step gates; regression-locked against the footage
+facts in `tests/test_ai.c` (`make test_ai`).
+
 ## 3. Behaviour types (pad3b[2] = catcher+0x62) & their target + cap  [data-driven]
 
 `spawn_enemy(x,y,z, entity_mode, param6=tile.clip_rule)`:
