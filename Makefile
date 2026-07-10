@@ -57,6 +57,11 @@ $(BIN)/test_level: tests/test_level.c $(FMT_ALL) | $(BIN)
 	$(CC) $(CFLAGS) -o $@ $^
 test_level: $(BIN)/test_level ; ./$(BIN)/test_level
 
+$(BIN)/test_ai: tests/test_ai.c src/sim/sim.c $(FMT_ALL) | $(BIN)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+SABASE ?= ../game_root/SkippyAdventure
+test_ai: $(BIN)/test_ai ; ./$(BIN)/test_ai "$(SABASE)"
+
 # ---- game (M1: raylib render of Forest/Start) ----
 RL_CFLAGS := $(shell pkg-config --cflags raylib)
 RL_LIBS   := $(shell pkg-config --libs raylib) -lm -Wl,-rpath,/usr/local/lib

@@ -312,6 +312,16 @@ static void init_teleport_pairs(sim_state *s, const jjm_level *lvl)
 		}
 }
 
+/* behaviour type + search cap from the spawn tile's clip_rule (re_g6_enemy_ai.md §3):
+ * the map authors each enemy's AI; clip >= 0x65 is a model/skin variant -> plain
+ * chaser. The cap is the pathfinder's pop budget = the de-facto aggro range. */
+static void ai_assign(sim_player *e, uint8_t clip)
+{
+	static const unsigned short caps[8] = { 50, 400, 100, 150, 50, 50, 50, 150 };
+	e->ai_type = clip >= 0x65 ? 0 : clip;
+	e->ai_cap  = e->ai_type < 8 ? caps[e->ai_type] : 50;
+}
+
 static void init_spawns(sim_state *s, const jjm_level *lvl)
 {
 	/* spawn catcher enemies at pickup-byte 2 cells; throwers at pickup-byte 3.
@@ -319,12 +329,16 @@ static void init_spawns(sim_state *s, const jjm_level *lvl)
 	 * on contact — so they live in the enemies[] array with is_thrower set. */
 	for (int x = 0; x < lvl->dim_x; x++)
 		for (int y = 0; y < lvl->dim_y; y++) {
-			if (lvl->tiles[x][y].pickup_type == PU_CATCHER && s->num_enemies < SIM_MAX_ENEMIES)
-				place_entity(s, &s->enemies[s->num_enemies++], x, y, DIR_NX);
+			if (lvl->tiles[x][y].pickup_type == PU_CATCHER && s->num_enemies < SIM_MAX_ENEMIES) {
+				sim_player *c = &s->enemies[s->num_enemies++];
+				place_entity(s, c, x, y, DIR_NX);
+				ai_assign(c, lvl->tiles[x][y].clip_rule);
+			}
 			if (lvl->tiles[x][y].pickup_type == PU_THROWER && s->num_enemies < SIM_MAX_ENEMIES) {
 				sim_player *th = &s->enemies[s->num_enemies++];
 				place_entity(s, th, x, y, DIR_NX);
 				th->is_thrower = true;
+				ai_assign(th, lvl->tiles[x][y].clip_rule);
 			}
 			if (lvl->tiles[x][y].pickup_type == PU_FACTORY && s->num_factories < SIM_MAX_FACTORIES) {
 				int cl = lvl->tiles[x][y].clip_rule;
@@ -899,6 +913,7 @@ static void factory_tick(sim_state *s, float dt, bool frozen)
 			continue;                                  /* board truly full of live enemies */
 		memset(slot, 0, sizeof *slot);                 /* clear removed/dying/thrower state */
 		place_entity(s, slot, f->cx, f->cy, DIR_NX);
+		ai_assign(slot, 0);                            /* factory spawns are plain chasers */
 	}
 }
 
@@ -1118,8 +1133,8 @@ static bool try_launch_jumppad(sim_state *s, sim_player *p, bool is_player, int 
 	p->launch_v0 = sqrtf((zT - z0 + JUMPPAD_BIAS) * JUMPPAD_G2);
 	p->launch_fx = p->cx + dx;
 	p->launch_fy = p->cy + dy;
-	if (is_player)
-		raise_event(s, SIM_EV_JUMPPAD, p->rx, p->ry, p->rz);   /* MoveJumpPad */
+	(void)is_player;   /* the pad's boing is a WORLD sound — it fires for enemies too */
+	raise_event(s, SIM_EV_JUMPPAD, p->rx, p->ry, p->rz);   /* MoveJumpPad */
 	return true;
 }
 
@@ -1545,93 +1560,422 @@ static void tick_entity(sim_state *s, sim_player *p, float dt, bool is_player)
 	tick_idle(s, p, is_player);
 }
 
-/* Can an entity move fx,fy -> tx,ty during a chase? Either a flat/stair step, OR a
- * hop DOWN of up to 2 blocks (lands safely — same rule the player follows). Excludes
- * upward non-stair moves and >2-block drops (fall past into the void / splat). */
-static bool ai_passable(const sim_state *s, int fx, int fy, int tx, int ty)
+/* ==== enemy chase AI — faithful port of the original pathfinder ================
+ * RE re_g6_enemy_ai.md §2/§2b/§3/§4: ai_pathfind_astar 0x401db0, expand 0x401ef0,
+ * insert/relax 0x402000/0x402170/0x4021b0, target+cap table in game_tick.
+ *
+ * The search runs BACKWARD — root = the target (usually the player), goal = the
+ * enemy — so the goal node's parent is the enemy's next hop. Edges are checked in
+ * the root->enemy direction with a CLIMB-only height rule (0 < dz <= 2): walked in
+ * reverse by the enemy those climbs are its <=2 hop-downs — the original builds the
+ * enemy's one-way movement graph by searching it backward. The pop cap is the
+ * de-facto aggro range: budget spent -> no move this frame, and the whole thing is
+ * re-run every frame with no memory (a live range gate, not an aggro latch). */
+
+/* is (x,y) on a moving platform's track? The original registers the WHOLE track run
+ * as plannable floor at the track z (register_platform_cell 0x417e20 stamps a
+ * per-cell flag + z through the empty run) — the platform's live position only
+ * gates EXECUTION (§4 / kind_at), which is what makes enemies walk up to a mover
+ * gap and wait for the ride. */
+static bool mover_track_z(const sim_state *s, int x, int y, int *z)
 {
-	if (is_step(s, fx, fy, tx, ty))
-		return true;
-	if (kind_at(s, tx, ty) != CK_FLOOR)
-		return false;
-	float drop = cell_top(s, fx, fy) - cell_top(s, tx, ty);
-	return drop > 0.0f && drop <= 2.01f;
+	for (int i = 0; i < s->num_platforms; i++) {
+		const sim_platform *p = &s->platforms[i];
+		for (int k = 0; k <= p->range; k++)
+			if (p->hx + k * p->dx == x && p->hy + k * p->dy == y) {
+				if (z)
+					*z = p->hz;
+				return true;
+			}
+	}
+	return false;
 }
 
-/* Best-first search over passable cells from the enemy toward the player, CAPPED at
- * AI_MAX_EXPAND expansions; returns the enemy's first step (0-3) or -1 = no move.
- * The cap is the aggro gate (RE re_g6_enemy_ai.md: the original A* is bounded to ~50
- * node expansions — an enemy the player hasn't approached within that budget gets no
- * move, so foes wake region-by-region as the player nears, NOT all at once). Enemy-rooted
- * (not player-rooted like the original) so ai_passable is checked in the enemy's own
- * travel direction (it's directional: down-hop <=2 ok, up only via stairs); greedy toward
- * the player gives the original's directed reach. */
-#define AI_MAX_EXPAND 50
-static int ai_next_dir(sim_state *s, sim_player *e)
+/* edge-height for planning: like tile_z, but a bare void cell on a mover track
+ * counts at the track z (the plannable-floor rule above). */
+static int ai_z(const sim_state *s, int x, int y)
+{
+	int z;
+	if (s->lvl->tiles[x][y].type == TT_VOID && s->plank_z[x][y] < 0
+	    && !dynamic_floor(s, x, y, NULL) && mover_track_z(s, x, y, &z))
+		return z;
+	return tile_z(s, x, y);
+}
+
+/* the original stamps entity_reservation (tile +0x1a5) on cells an entity occupies
+ * or is entering: 4 = the player, others = enemies. Pathing reads it in the switch
+ * and glue clauses below. */
+static int ai_reserved(const sim_state *s, int x, int y)
+{
+	if ((s->p.cx == x && s->p.cy == y) || (s->p.moving && s->p.tx == x && s->p.ty == y))
+		return 4;
+	if (enemy_occupies(s, x, y, NULL))
+		return 2;
+	return 0;
+}
+
+/* node walkability (is_cell_walkable 0x401cd0, catcher-mode rules): statically
+ * typed cells count — an elevator shaft or a mover's home cell is a graph NODE even
+ * while the car/platform is elsewhere (that's what lets enemies path to a mover and
+ * WAIT for it; presence/alignment gates the actual step, not the plan). */
+static bool ai_walkable(const sim_state *s, const sim_player *e, int x, int y)
+{
+	const jjm_level *l = s->lvl;
+	if (x < 0 || y < 0 || x >= l->dim_x || y >= l->dim_y)
+		return false;
+	uint8_t t = l->tiles[x][y].type;
+	if (t == TT_VOID)      /* bare void: a deployed plank, a parked mover, or any
+	                          cell of a mover's registered track (plannable floor) */
+		return s->plank_z[x][y] >= 0 || dynamic_floor(s, x, y, NULL)
+		       || mover_track_z(s, x, y, NULL);
+	if (t == TT_DECOR)
+		return false;
+	if (t == TT_OBSTACLE)
+		return s->obstacle_gone[x][y];
+	if (t == TT_DESTRUCT)
+		return !s->destruct_open[x][y];
+	if (t == TT_SWITCH)    /* mode-2 rule: catchers pass a switch only while it is
+	                          occupied or player-reserved (0x401cd0) */
+		return (e && e->is_thrower) || ai_reserved(s, x, y) != 0;
+	return true;
+}
+
+/* does an elevator shaft at (x,y) have an endpoint parking the car level with z? */
+static bool elev_endpoint(const sim_state *s, int x, int y, int z)
+{
+	for (int i = 0; i < s->num_elevators; i++)
+		if (s->elevators[i].cx == x && s->elevators[i].cy == y)
+			return s->elevators[i].z0 == z || s->elevators[i].z1 == z;
+	return false;
+}
+
+/* edge legality for the enemy's hop (fx,fy)->(tx,ty) — tile_passable 0x41f500
+ * transcribed clause-for-clause; LATER clauses OVERRIDE earlier ones exactly like
+ * the original's write-then-override chain. NB: astar expands cur->nb but validates
+ * the move nb->cur (expand 0x401ef0 passes (to=cur, from=nb)) — i.e. every edge is
+ * checked in the ENEMY'S OWN travel direction, drops downhill toward the player. */
+static bool ai_edge(const sim_state *s, int fx, int fy, int tx, int ty)
+{
+	const jjm_level *l = s->lvl;
+	const jjm_tile *ft = &l->tiles[fx][fy], *tt = &l->tiles[tx][ty];
+	int fz = ai_z(s, fx, fy), tz = ai_z(s, tx, ty);
+	bool sf = is_stair(l, fx, fy), st = is_stair(l, tx, ty);
+	bool pass = false;
+	/* stair pairs + flat steps: the player's own verified surface-follow rule */
+	if (sf || st)
+		pass = is_step(s, fx, fy, tx, ty);
+	else if (tz == fz && tt->type != TT_SLIDE)
+		pass = true;
+	/* elevator endpoint edges: board/leave a shaft whose car PARKS level with the
+	 * neighbour floor — plannable while the car is away; timing is ai_step's gate */
+	if (tz != fz || tt->type == TT_SLIDE) {
+		if (ft->type == TT_ELEVATOR && elev_endpoint(s, fx, fy, tz))
+			pass = true;
+		else if (tt->type == TT_ELEVATOR && elev_endpoint(s, tx, ty, fz))
+			pass = true;
+	}
+	/* hop-down 1..2 onto a plain (non-slide, non-planked) cell */
+	if (!sf && tt->type != TT_SLIDE && fz - tz > 0 && fz - tz < 3)
+		pass = s->plank_z[tx][ty] < 0;
+	/* rutsche: enterable only FLAT along its forced direction; always exitable */
+	if (tt->type == TT_SLIDE && tz == fz) {
+		int fc = tt->clip_rule;
+		pass = fc >= 1 && fc <= 4
+		       && tx - fx == DX[SPAWN_FACE[fc]] && ty - fy == DY[SPAWN_FACE[fc]];
+	}
+	if (ft->type == TT_SLIDE)
+		pass = true;
+	/* jump-pad portal: entering requires the landing one-further along the travel
+	 * dir to sit at the pad's launch height; exiting a pad ignores height */
+	if (tt->type == TT_JUMPPAD) {
+		int lx = tx + (tx - fx), ly = ty + (ty - fy);
+		pass = lx >= 0 && ly >= 0 && lx < l->dim_x && ly < l->dim_y
+		       && tile_z(s, lx, ly) == (int)tt->clip_rule;
+	}
+	if (ft->type == TT_JUMPPAD)
+		pass = true;
+	/* glue gate (the 2-cell look-ahead RETURN at 0x41f500's tail): an UNRESERVED
+	 * glue cell may only be ENTERED when the cell straight beyond it is reserved
+	 * BY THE PLAYER (entity_reservation == 4). A glue pen stays sealed until the
+	 * player physically steps into the escape lane — the few-frames "i'm in its
+	 * path" wake (verified vs Space\Bonus footage: dormant from spawn (7,9),
+	 * woken from the ice at (7,8)/(10,7)). */
+	if (tt->type == TT_GLUE && ai_reserved(s, tx, ty) == 0) {
+		int lx = tx + (tx - fx), ly = ty + (ty - fy);
+		return lx >= 0 && ly >= 0 && lx < l->dim_x && ly < l->dim_y
+		       && ai_reserved(s, lx, ly) == 4;
+	}
+	return pass;
+}
+
+/* pathfinder node (the original's 0x44-byte layout): f = g + h with g = hop count
+ * and h = squared grid distance to the goal (the enemy). The open list is a linked
+ * list kept sorted ascending by f AT INSERT TIME — a tie lands BEFORE the equal-f
+ * run (LIFO on plateaus, 0x402170's `<`) — and "pop best" just takes the head
+ * (0x401ec0). In-open g-improvements update fields WITHOUT repositioning (stale
+ * order kept, 0x402000); improvements reaching a CLOSED node propagate through its
+ * recorded children (0x4021b0). All quirks replicated: they shape which cells a
+ * 50-pop budget reaches, i.e. the exact wake boundaries. */
+typedef struct {
+	int   f, g, h;
+	short x, y;
+	short parent;          /* -1 = root (the target's cell) */
+	short next;            /* sorted open-list link; -1 = tail */
+	short child[4];        /* neighbors relaxed through this node (propagation) */
+	short nchild;
+	bool  closed;
+} ai_node;
+
+#define AI_NODE_MAX 1601   /* 1 root + 4 per pop at the largest cap (400) */
+
+static ai_node ai_pool[AI_NODE_MAX];
+static short   ai_cell[JJM_MAX_DIM][JJM_MAX_DIM];   /* cell -> node index; -1 none */
+static short   ai_open;                             /* sorted open-list head */
+static short   ai_nn;                               /* nodes allocated this search */
+
+static short ai_alloc(int x, int y, int g, int h, short parent)
+{
+	if (ai_nn >= AI_NODE_MAX)
+		return -1;
+	ai_node *n = &ai_pool[ai_nn];
+	n->f = g + h; n->g = g; n->h = h;
+	n->x = (short)x; n->y = (short)y;
+	n->parent = parent;
+	n->next = -1;
+	n->nchild = 0;
+	n->closed = false;
+	ai_cell[x][y] = ai_nn;
+	return ai_nn++;
+}
+
+static void ai_open_insert(short id)
+{
+	short *link = &ai_open;
+	while (*link >= 0 && ai_pool[*link].f < ai_pool[id].f)
+		link = &ai_pool[*link].next;
+	ai_pool[id].next = *link;
+	*link = id;
+}
+
+/* a g-improvement reached a CLOSED node: push it down through the recorded children
+ * (0x4021b0's work list; queue-full just stops propagating — harmless, rare). */
+static void ai_propagate(short id)
+{
+	static short q[AI_NODE_MAX];
+	int qh = 0, qt = 0;
+	q[qt++] = id;
+	while (qh < qt) {
+		ai_node *n = &ai_pool[q[qh++]];
+		for (int i = 0; i < n->nchild; i++) {
+			ai_node *c = &ai_pool[n->child[i]];
+			if (n->g + 1 < c->g) {
+				c->g = n->g + 1;
+				c->f = c->h + c->g;
+				c->parent = (short)(n - ai_pool);
+				if (qt < AI_NODE_MAX)
+					q[qt++] = n->child[i];
+			}
+		}
+	}
+}
+
+/* one chase decision for enemy e hunting (tx,ty): the enemy's next hop direction,
+ * or -1 = no move this frame (out of budget = dormant / no route / mid-anything). */
+static int ai_next_dir(sim_state *s, const sim_player *e, int tx, int ty)
 {
 	const jjm_level *l = s->lvl;
 	int W = l->dim_x, H = l->dim_y;
-	int sx = e->cx, sy = e->cy, tx = s->p.cx, ty = s->p.cy;
-	if ((sx == tx && sy == ty) || tx < 0 || ty < 0 || tx >= W || ty >= H)
+	int gx = e->cx, gy = e->cy;                    /* GOAL = the enemy (backward) */
+	if ((gx == tx && gy == ty) || tx < 0 || ty < 0 || tx >= W || ty >= H)
 		return -1;
+	if (!ai_walkable(s, e, tx, ty) || !ai_walkable(s, e, gx, gy))
+		return -1;                                 /* ai_compute_path endpoint guard */
 
-	static signed char came[JJM_MAX_DIM][JJM_MAX_DIM];   /* dir stepped INTO a cell; -2 = unvisited */
-	static short qx[JJM_MAX_DIM * JJM_MAX_DIM], qy[JJM_MAX_DIM * JJM_MAX_DIM];
 	for (int x = 0; x < W; x++)
 		for (int y = 0; y < H; y++)
-			came[x][y] = -2;
-	int nf = 0;                          /* frontier (best-first, rescanned each pop) */
-	qx[nf] = sx; qy[nf] = sy; nf++;
-	came[sx][sy] = -1;
-	int expanded = 0;
-	bool found = false;
-	while (nf > 0 && expanded < AI_MAX_EXPAND) {
-		int best = 0;                    /* pop the frontier cell nearest the player */
-		long bd = (long)(qx[0] - tx) * (qx[0] - tx) + (long)(qy[0] - ty) * (qy[0] - ty);
-		for (int i = 1; i < nf; i++) {
-			long dd = (long)(qx[i] - tx) * (qx[i] - tx) + (long)(qy[i] - ty) * (qy[i] - ty);
-			if (dd < bd) { bd = dd; best = i; }
+			ai_cell[x][y] = -1;
+	ai_open = -1;
+	ai_nn = 0;
+	ai_open_insert(ai_alloc(tx, ty, 0,
+	                        (tx - gx) * (tx - gx) + (ty - gy) * (ty - gy), -1));
+
+	/* fixed expansion order (0x401ef0): (x,y-1) (x+1,y) (x,y+1) (x-1,y) in the
+	 * ORIGINAL's axes — which are transposed vs the rewrite grid (its dir codes map
+	 * 1 -> our -X in the verified SPAWN_FACE/slide tables), so in our coords: */
+	static const sim_dir EXPAND[4] = { DIR_NX, DIR_PY, DIR_PX, DIR_NY };
+	short found = -1;
+	int pops = 0;
+	do {
+		short cur = ai_open;
+		if (cur < 0)
+			return -1;                             /* open list dry: no route at all */
+		ai_open = ai_pool[cur].next;
+		ai_pool[cur].closed = true;
+		if (ai_pool[cur].x == gx && ai_pool[cur].y == gy) {
+			found = cur;
+			break;
 		}
-		int cx = qx[best], cy = qy[best];
-		qx[best] = qx[--nf]; qy[best] = qy[nf];   /* remove from frontier */
-		expanded++;
-		if (cx == tx && cy == ty) { found = true; break; }
-		for (int d = 0; d < 4; d++) {
-			int nx = cx + DX[d], ny = cy + DY[d];
-			if (nx < 0 || ny < 0 || nx >= W || ny >= H || came[nx][ny] != -2)
+		for (int i = 0; i < 4; i++) {
+			int nx = ai_pool[cur].x + DX[EXPAND[i]], ny = ai_pool[cur].y + DY[EXPAND[i]];
+			if (nx < 0 || ny < 0 || nx >= W || ny >= H)
 				continue;
-			if (!ai_passable(s, cx, cy, nx, ny))
+			/* is_cell_walkable(nb) + tile_passable(to=cur, from=nb): the edge is
+			 * validated as the enemy's own move nb->cur (0x401ef0) */
+			if (!ai_walkable(s, e, nx, ny)
+			    || !ai_edge(s, nx, ny, ai_pool[cur].x, ai_pool[cur].y))
 				continue;
-			came[nx][ny] = (signed char)d;
-			qx[nf] = nx; qy[nf] = ny; nf++;
+			int g2 = ai_pool[cur].g + 1;
+			short nb = ai_cell[nx][ny];
+			if (nb < 0) {
+				nb = ai_alloc(nx, ny, g2,
+				              (nx - gx) * (nx - gx) + (ny - gy) * (ny - gy), cur);
+				if (nb < 0)
+					continue;
+				ai_open_insert(nb);
+			} else if (g2 < ai_pool[nb].g) {
+				ai_pool[nb].g = g2;
+				ai_pool[nb].f = ai_pool[nb].h + g2;
+				ai_pool[nb].parent = cur;
+				if (ai_pool[nb].closed)
+					ai_propagate(nb);
+				/* in-open: fields updated, stale list position kept (0x402000) */
+			}
+			if (ai_pool[cur].nchild < 4)
+				ai_pool[cur].child[ai_pool[cur].nchild++] = nb;
 		}
-	}
-	if (!found)
-		return -1;                       /* player outside the search budget -> dormant */
-	int cx = tx, cy = ty;                /* backtrack to the step adjacent to the enemy */
-	while (!(cx == sx && cy == sy)) {
-		int d = came[cx][cy];
-		int px = cx - DX[d], py = cy - DY[d];
-		if (px == sx && py == sy)
+		pops++;
+	} while (pops < e->ai_cap);
+	if (found < 0)
+		return -1;                                 /* budget spent: out of aggro range */
+	short par = ai_pool[found].parent;             /* adjacent to the enemy — its next cell */
+	if (par < 0)
+		return -1;
+	for (int d = 0; d < 4; d++)
+		if (gx + DX[d] == ai_pool[par].x && gy + DY[d] == ai_pool[par].y)
 			return d;
-		cx = px; cy = py;
-	}
 	return -1;
 }
 
-/* chase: pathfind, turn to face the next step, step when already facing. */
+/* per-frame chase target by behaviour type (re_g6_enemy_ai.md §3, chosen in
+ * game_tick); false = idle this frame. Types 5/7 target-finders are only partially
+ * traced (MEDIUM confidence): 5 follows the nearest other catcher, 7 idles. */
+static bool ai_target(const sim_state *s, const sim_player *e, int *tx, int *ty)
+{
+	const jjm_level *l = s->lvl;
+	int bx = -1, by = -1;
+	long bd = 0;
+	switch (e->ai_type) {
+	case 1:                        /* walks to the level exit (the type-4 cell) */
+		for (int x = 0; x < l->dim_x; x++)
+			for (int y = 0; y < l->dim_y; y++)
+				if (l->tiles[x][y].type == TT_EXIT) {
+					*tx = x; *ty = y;
+					return true;
+				}
+		break;
+	case 2:                        /* crystal-seeker; the player once none remain */
+		for (int x = 0; x < l->dim_x; x++)
+			for (int y = 0; y < l->dim_y; y++) {
+				if (l->tiles[x][y].pickup_type != PU_CRYSTAL || s->picked[x][y])
+					continue;
+				long dd = (long)(x - e->cx) * (x - e->cx) + (long)(y - e->cy) * (y - e->cy);
+				if (bx < 0 || dd < bd) { bd = dd; bx = x; by = y; }
+			}
+		break;
+	case 3:                        /* nearest type-5 cell (find_cell_of_type 0x41b810,
+	                                  doc-literal); the player when none */
+		for (int x = 0; x < l->dim_x; x++)
+			for (int y = 0; y < l->dim_y; y++) {
+				if (l->tiles[x][y].type != 5)
+					continue;
+				long dd = (long)(x - e->cx) * (x - e->cx) + (long)(y - e->cy) * (y - e->cy);
+				if (bx < 0 || dd < bd) { bd = dd; bx = x; by = y; }
+			}
+		break;
+	case 5:                        /* leader-follow: the nearest other catcher; else idle */
+		for (int i = 0; i < s->num_enemies; i++) {
+			const sim_player *o = &s->enemies[i];
+			if (o == e || o->removed || !o->alive || o->is_thrower)
+				continue;
+			long dd = (long)(o->cx - e->cx) * (o->cx - e->cx)
+			        + (long)(o->cy - e->cy) * (o->cy - e->cy);
+			if (bx < 0 || dd < bd) { bd = dd; bx = o->cx; by = o->cy; }
+		}
+		if (bx < 0)
+			return false;
+		break;
+	case 7:                        /* special finder (FUN_00412530) unresolved: idle */
+		return false;
+	default:
+		break;
+	}
+	if ((e->ai_type == 2 || e->ai_type == 3 || e->ai_type == 5) && bx >= 0) {
+		*tx = bx; *ty = by;
+		return true;
+	}
+	*tx = s->p.cx;
+	*ty = s->p.cy;
+	return true;
+}
+
+/* §4 "mistimed platform" gate: will the platform under (x,y) still be there when a
+ * hop STARTED NOW lands (MOVE_DUR later)? A mover crosses a full cell per hop
+ * (MOVER_SPEED), so boarding a departing car always lands in the gap — the enemy
+ * must decline the hop and wait for the next pass. True when no platform is
+ * involved (static floor) or the landing is covered. */
+static bool platform_safe_landing(const sim_state *s, int x, int y)
+{
+	for (int i = 0; i < s->num_platforms; i++) {
+		const sim_platform *p = &s->platforms[i];
+		int rt = (int)(p->t + 0.5f);
+		if (p->hx + p->dx * rt != x || p->hy + p->dy * rt != y
+		    || p->t - (float)rt >= 0.3f || p->t - (float)rt <= -0.3f)
+			continue;                          /* this platform isn't the floor here */
+		if (p->range == 0)
+			return true;
+		if (p->phase == 0)                     /* parked: departs before we land? */
+			return MOVER_WAIT - p->wait > MOVE_DUR + 0.05f;
+		float tl = p->t + (p->phase == 1 ? 1.0f : -1.0f) * MOVER_SPEED * MOVE_DUR;
+		if (tl < 0.0f)
+			tl = 0.0f;
+		if (tl > (float)p->range)
+			tl = (float)p->range;              /* arriving INTO this end cell is fine */
+		return tl - (float)rt < 0.25f && tl - (float)rt > -0.25f;
+	}
+	return true;
+}
+
+/* chase: pick the target, pathfind, turn to face the hop, then step — with the §4
+ * gates: never side-step off a jump-pad (ride it out), wait for a misaligned
+ * elevator/platform, never step into a live gap. */
 static void ai_step(sim_state *s, sim_player *e)
 {
 	if (!e->alive || e->removed || e->dying_t > 0.0f
-	    || e->moving || e->turning || e->falling || e->glue_t > 0.0f)
+	    || e->moving || e->turning || e->falling || e->glue_t > 0.0f || e->launching)
 		return;
-	int d = ai_next_dir(s, e);
+	if (s->lvl->tiles[e->cx][e->cy].type == TT_JUMPPAD)
+		return;                    /* on a pad: must ride it (tick_idle fires the launch) */
+	int tx, ty;
+	if (!ai_target(s, e, &tx, &ty))
+		return;
+	int d = ai_next_dir(s, e, tx, ty);
 	if (d < 0)
 		return;
-	if (e->facing == (sim_dir)d)
-		step_entity(s, e, (sim_dir)d);
-	else
+	if (e->facing != (sim_dir)d) {
 		turn_entity(s, e, CW[e->facing] == (sim_dir)d ? 1 : -1);
+		return;
+	}
+	int nx = e->cx + DX[d], ny = e->cy + DY[d];
+	if (kind_at(s, nx, ny) != CK_FLOOR)
+		return;                    /* §4: no live floor there NOW (mover away, hole open) */
+	if (!platform_safe_landing(s, nx, ny))
+		return;                    /* §4: the car departs before the hop lands — wait */
+	if (s->lvl->tiles[nx][ny].type == TT_ELEVATOR) {
+		float dz = cell_top(s, nx, ny) - cell_top(s, e->cx, e->cy);
+		if (dz > 0.25f || dz < -0.25f)
+			return;                /* §4: the car isn't level with this floor — wait */
+	}
+	step_entity(s, e, (sim_dir)d);
 }
 
 void sim_tick(sim_state *s, float dt)
